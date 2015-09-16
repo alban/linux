@@ -16,7 +16,7 @@
 #define SIGKVMPAUSE		(SIGRTMIN + 1)
 
 #define KVM_PID_FILE_PATH	"/.lkvm/"
-#define HOME_DIR		getenv("HOME")
+#define HOME_DIR		"/root"
 #define KVM_BINARY_NAME		"lkvm"
 
 #define PAGE_SIZE (sysconf(_SC_PAGE_SIZE))
