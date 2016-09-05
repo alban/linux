@@ -26,6 +26,7 @@
 #include <linux/file.h>
 #include <linux/syscalls.h>
 #include <linux/cgroup.h>
+#include <linux/cn_proc.h>
 
 static struct kmem_cache *nsproxy_cachep;
 
@@ -191,6 +192,7 @@ void free_nsproxy(struct nsproxy *ns)
 int unshare_nsproxy_namespaces(unsigned long unshare_flags,
 	struct nsproxy **new_nsp, struct cred *new_cred, struct fs_struct *new_fs)
 {
+	struct ns_common *ns;
 	struct user_namespace *user_ns;
 	int err = 0;
 
@@ -207,6 +209,63 @@ int unshare_nsproxy_namespaces(unsigned long unshare_flags,
 	if (IS_ERR(*new_nsp)) {
 		err = PTR_ERR(*new_nsp);
 		goto out;
+	}
+
+	if (unshare_flags & CLONE_NEWUSER) {
+		ns = userns_operations.get(current);
+	        if (ns) {
+			proc_nm_connector(current, CLONE_NEWUSER, 2, ns->inum);
+		}
+
+                userns_operations.put(ns);
+	}
+	if (unshare_flags & CLONE_NEWNS) {
+		ns = mntns_operations.get(current);
+	        if (ns) {
+			proc_nm_connector(current, CLONE_NEWNS, 2, ns->inum);
+		}
+
+                mntns_operations.put(ns);
+	}
+	if (unshare_flags & CLONE_NEWUTS) {
+		ns = utsns_operations.get(current);
+	        if (ns) {
+			proc_nm_connector(current, CLONE_NEWUTS, 2, ns->inum);
+		}
+
+                utsns_operations.put(ns);
+	}
+	if (unshare_flags & CLONE_NEWIPC) {
+		ns = ipcns_operations.get(current);
+	        if (ns) {
+			proc_nm_connector(current, CLONE_NEWIPC, 2, ns->inum);
+		}
+
+                ipcns_operations.put(ns);
+	}
+	if (unshare_flags & CLONE_NEWNET) {
+		ns = netns_operations.get(current);
+	        if (ns) {
+			proc_nm_connector(current, CLONE_NEWNET, 2, ns->inum);
+		}
+
+                netns_operations.put(ns);
+	}
+	if (unshare_flags & CLONE_NEWPID) {
+		ns = pidns_operations.get(current);
+	        if (ns) {
+			proc_nm_connector(current, CLONE_NEWPID, 2, ns->inum);
+		}
+
+                pidns_operations.put(ns);
+	}
+	if (unshare_flags & CLONE_NEWCGROUP) {
+		ns = cgroupns_operations.get(current);
+	        if (ns) {
+			proc_nm_connector(current, CLONE_NEWCGROUP, 2, ns->inum);
+		}
+
+                cgroupns_operations.put(ns);
 	}
 
 out:
@@ -262,6 +321,8 @@ SYSCALL_DEFINE2(setns, int, fd, int, nstype)
 		goto out;
 	}
 	switch_task_namespaces(tsk, new_nsproxy);
+
+	proc_nm_connector(current, ns->ops->type, 1, file_inode(file)->i_ino);
 out:
 	fput(file);
 	return err;
