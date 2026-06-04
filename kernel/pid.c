@@ -637,7 +637,7 @@ struct task_struct *pidfd_get_task(int pidfd, unsigned int *flags)
 		pid = pidfd_get_pid(pidfd, &f_flags);
 		if (IS_ERR(pid))
 			return ERR_CAST(pid);
-		type = PIDTYPE_TGID;
+		type = (f_flags & PIDFD_THREAD) ? PIDTYPE_PID : PIDTYPE_TGID;
 		break;
 	}
 
