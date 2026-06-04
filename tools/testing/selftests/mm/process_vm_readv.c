@@ -28,6 +28,10 @@
 #define PROCESS_VM_NOWAIT	(1UL << 1)
 #endif
 
+#ifndef PIDFD_THREAD
+#define PIDFD_THREAD		O_EXCL
+#endif
+
 static int sys_pidfd_open(pid_t pid, unsigned int flags)
 {
 	return syscall(__NR_pidfd_open, pid, flags);
@@ -586,6 +590,315 @@ TEST(read_nowait_partial_two_iovecs)
 	free(buf2);
 	munmap(mem, 2 * page_size);
 	close(uffd);
+}
+
+/*
+ * Test: PIDFD_THREAD pidfd for the thread-group leader should work
+ * just like a regular pidfd (regression guard).
+ */
+TEST(read_pidfd_thread_leader)
+{
+	uint8_t buf[sizeof(test_data)];
+	struct iovec local_iov = { .iov_base = buf, .iov_len = sizeof(buf) };
+	struct iovec remote_iov = {
+		.iov_base = (void *)test_data,
+		.iov_len = sizeof(test_data)
+	};
+	ssize_t n;
+	int pidfd;
+
+	memset(buf, POISON_BYTE, sizeof(buf));
+	pidfd = sys_pidfd_open(getpid(), PIDFD_THREAD);
+	if (pidfd < 0 && (errno == ENOSYS || errno == EINVAL))
+		SKIP(return, "pidfd_open with PIDFD_THREAD not supported");
+	ASSERT_GE(pidfd, 0);
+
+	n = process_vm_readv(pidfd, &local_iov, 1, &remote_iov, 1,
+			     PROCESS_VM_PIDFD);
+	if (n == -1 && errno == EINVAL)
+		SKIP(return, "PROCESS_VM_PIDFD not supported");
+	ASSERT_EQ(sizeof(test_data), n);
+	ASSERT_EQ(0, memcmp(buf, test_data, sizeof(test_data)));
+
+	close(pidfd);
+}
+
+/*
+ * Helper: child process that creates a secondary thread, writes its TID
+ * and a shared buffer address to the parent via a pipe, then waits.
+ */
+struct child_thread_info {
+	pid_t main_pid;
+	pid_t secondary_tid;
+	void *shared_addr;
+};
+
+static void *secondary_thread_fn(void *arg)
+{
+	int *pipes = (int *)arg;
+	pid_t tid = syscall(SYS_gettid);
+
+	/* Signal TID to parent */
+	write(pipes[1], &tid, sizeof(tid));
+
+	/* Wait until parent is done */
+	char c;
+	read(pipes[0], &c, 1);
+	return NULL;
+}
+
+/*
+ * Test: PIDFD_THREAD pidfd for a non-leader thread should succeed
+ * (requires the pidfd_get_task fix to use PIDTYPE_PID for PIDFD_THREAD).
+ */
+TEST(read_pidfd_thread_non_leader)
+{
+	struct child_thread_info info;
+	int info_pipe[2], done_pipe[2];
+	uint8_t buf[8];
+	ssize_t n;
+	int pidfd;
+	pid_t child_pid;
+
+	ASSERT_EQ(0, pipe(info_pipe));
+	ASSERT_EQ(0, pipe(done_pipe));
+
+	child_pid = fork();
+	ASSERT_NE(-1, child_pid);
+
+	if (child_pid == 0) {
+		/* Child: create shared data + secondary thread */
+		pthread_t thr;
+		int thread_pipes[2] = { done_pipe[0], info_pipe[1] };
+		void *shared = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+				    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		memset(shared, 0x42, 8);
+
+		/* Write shared address */
+		write(info_pipe[1], &shared, sizeof(shared));
+
+		pthread_create(&thr, NULL, secondary_thread_fn, thread_pipes);
+		pthread_join(thr, NULL);
+		_exit(0);
+	}
+
+	close(info_pipe[1]);
+	close(done_pipe[0]);
+
+	/* Read shared address from child */
+	ASSERT_EQ(sizeof(info.shared_addr),
+		  read(info_pipe[0], &info.shared_addr, sizeof(info.shared_addr)));
+	/* Read secondary thread TID */
+	ASSERT_EQ(sizeof(info.secondary_tid),
+		  read(info_pipe[0], &info.secondary_tid, sizeof(info.secondary_tid)));
+
+	/* Open PIDFD_THREAD for the non-leader thread */
+	pidfd = sys_pidfd_open(info.secondary_tid, PIDFD_THREAD);
+	if (pidfd < 0 && (errno == ENOSYS || errno == EINVAL)) {
+		write(done_pipe[1], "x", 1);
+		waitpid(child_pid, NULL, 0);
+		close(info_pipe[0]);
+		close(done_pipe[1]);
+		SKIP(return, "pidfd_open with PIDFD_THREAD not supported");
+	}
+	ASSERT_GE(pidfd, 0);
+
+	/* Read remote memory via PIDFD_THREAD pidfd */
+	memset(buf, POISON_BYTE, sizeof(buf));
+	struct iovec local_iov = { .iov_base = buf, .iov_len = sizeof(buf) };
+	struct iovec remote_iov = {
+		.iov_base = info.shared_addr,
+		.iov_len = sizeof(buf)
+	};
+	n = process_vm_readv(pidfd, &local_iov, 1, &remote_iov, 1,
+			     PROCESS_VM_PIDFD);
+	if (n == -1 && errno == EINVAL) {
+		close(pidfd);
+		write(done_pipe[1], "x", 1);
+		waitpid(child_pid, NULL, 0);
+		close(info_pipe[0]);
+		close(done_pipe[1]);
+		SKIP(return, "PROCESS_VM_PIDFD not supported");
+	}
+	ASSERT_EQ(sizeof(buf), n);
+	for (int i = 0; i < (int)sizeof(buf); i++)
+		ASSERT_EQ(0x42, buf[i]);
+
+	close(pidfd);
+	write(done_pipe[1], "x", 1);
+	waitpid(child_pid, NULL, 0);
+	close(info_pipe[0]);
+	close(done_pipe[1]);
+}
+
+/*
+ * Test: PIDFD_THREAD pidfd for a non-leader thread when the leader has
+ * exited (pthread_exit in main). This is the key scenario for profilers.
+ */
+TEST(read_pidfd_thread_exited_leader)
+{
+	void *shared_addr;
+	pid_t secondary_tid;
+	int info_pipe[2], done_pipe[2];
+	uint8_t buf[8];
+	ssize_t n;
+	int pidfd;
+	pid_t child_pid;
+
+	ASSERT_EQ(0, pipe(info_pipe));
+	ASSERT_EQ(0, pipe(done_pipe));
+
+	child_pid = fork();
+	ASSERT_NE(-1, child_pid);
+
+	if (child_pid == 0) {
+		/* Child: create shared data, spawn thread, exit main */
+		pthread_t thr;
+		int thread_pipes[2] = { done_pipe[0], info_pipe[1] };
+		void *shared = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+				    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		memset(shared, 0x77, 8);
+
+		/* Write shared address */
+		write(info_pipe[1], &shared, sizeof(shared));
+
+		pthread_create(&thr, NULL, secondary_thread_fn, thread_pipes);
+
+		/* Exit main thread, leaving secondary alive */
+		pthread_exit(NULL);
+	}
+
+	close(info_pipe[1]);
+	close(done_pipe[0]);
+
+	/* Read shared address from child */
+	ASSERT_EQ(sizeof(shared_addr),
+		  read(info_pipe[0], &shared_addr, sizeof(shared_addr)));
+	/* Read secondary thread TID */
+	ASSERT_EQ(sizeof(secondary_tid),
+		  read(info_pipe[0], &secondary_tid, sizeof(secondary_tid)));
+
+	/* Give the main thread time to fully exit */
+	usleep(100000);
+
+	/* Open PIDFD_THREAD for the alive non-leader thread */
+	pidfd = sys_pidfd_open(secondary_tid, PIDFD_THREAD);
+	if (pidfd < 0 && (errno == ENOSYS || errno == EINVAL)) {
+		write(done_pipe[1], "x", 1);
+		waitpid(child_pid, NULL, 0);
+		close(info_pipe[0]);
+		close(done_pipe[1]);
+		SKIP(return, "pidfd_open with PIDFD_THREAD not supported");
+	}
+	ASSERT_GE(pidfd, 0);
+
+	/* Read remote memory via PIDFD_THREAD pidfd */
+	memset(buf, POISON_BYTE, sizeof(buf));
+	struct iovec local_iov = { .iov_base = buf, .iov_len = sizeof(buf) };
+	struct iovec remote_iov = {
+		.iov_base = shared_addr,
+		.iov_len = sizeof(buf)
+	};
+	n = process_vm_readv(pidfd, &local_iov, 1, &remote_iov, 1,
+			     PROCESS_VM_PIDFD);
+	if (n == -1 && errno == EINVAL) {
+		close(pidfd);
+		write(done_pipe[1], "x", 1);
+		waitpid(child_pid, NULL, 0);
+		close(info_pipe[0]);
+		close(done_pipe[1]);
+		SKIP(return, "PROCESS_VM_PIDFD not supported");
+	}
+	ASSERT_EQ(sizeof(buf), n);
+	for (int i = 0; i < (int)sizeof(buf); i++)
+		ASSERT_EQ(0x77, buf[i]);
+
+	close(pidfd);
+	write(done_pipe[1], "x", 1);
+	waitpid(child_pid, NULL, 0);
+	close(info_pipe[0]);
+	close(done_pipe[1]);
+}
+
+/*
+ * Test: Regular pidfd for a process with an exited leader should fail
+ * with ESRCH (the zombie leader's task->mm is NULL). This is expected
+ * behavior and not fixed by the pidfd_get_task patch.
+ */
+TEST(read_pidfd_regular_exited_leader)
+{
+	void *shared_addr;
+	pid_t secondary_tid;
+	int info_pipe[2], done_pipe[2];
+	uint8_t buf[8];
+	ssize_t n;
+	int pidfd;
+	pid_t child_pid;
+
+	ASSERT_EQ(0, pipe(info_pipe));
+	ASSERT_EQ(0, pipe(done_pipe));
+
+	child_pid = fork();
+	ASSERT_NE(-1, child_pid);
+
+	if (child_pid == 0) {
+		pthread_t thr;
+		int thread_pipes[2] = { done_pipe[0], info_pipe[1] };
+		void *shared = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+				    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		memset(shared, 0x55, 8);
+
+		write(info_pipe[1], &shared, sizeof(shared));
+
+		pthread_create(&thr, NULL, secondary_thread_fn, thread_pipes);
+		pthread_exit(NULL);
+	}
+
+	close(info_pipe[1]);
+	close(done_pipe[0]);
+
+	ASSERT_EQ(sizeof(shared_addr),
+		  read(info_pipe[0], &shared_addr, sizeof(shared_addr)));
+	ASSERT_EQ(sizeof(secondary_tid),
+		  read(info_pipe[0], &secondary_tid, sizeof(secondary_tid)));
+
+	usleep(100000);
+
+	/* Open regular pidfd for the (zombie) leader */
+	pidfd = sys_pidfd_open(child_pid, 0);
+	if (pidfd < 0 && errno == ENOSYS) {
+		write(done_pipe[1], "x", 1);
+		waitpid(child_pid, NULL, 0);
+		close(info_pipe[0]);
+		close(done_pipe[1]);
+		SKIP(return, "pidfd_open not supported");
+	}
+	ASSERT_GE(pidfd, 0);
+
+	/* This should fail: zombie leader has task->mm == NULL */
+	struct iovec local_iov = { .iov_base = buf, .iov_len = sizeof(buf) };
+	struct iovec remote_iov = {
+		.iov_base = shared_addr,
+		.iov_len = sizeof(buf)
+	};
+	n = process_vm_readv(pidfd, &local_iov, 1, &remote_iov, 1,
+			     PROCESS_VM_PIDFD);
+	if (n == -1 && errno == EINVAL) {
+		close(pidfd);
+		write(done_pipe[1], "x", 1);
+		waitpid(child_pid, NULL, 0);
+		close(info_pipe[0]);
+		close(done_pipe[1]);
+		SKIP(return, "PROCESS_VM_PIDFD not supported");
+	}
+	ASSERT_EQ(-1, n);
+	ASSERT_EQ(ESRCH, errno);
+
+	close(pidfd);
+	write(done_pipe[1], "x", 1);
+	waitpid(child_pid, NULL, 0);
+	close(info_pipe[0]);
+	close(done_pipe[1]);
 }
 
 TEST_HARNESS_MAIN
